@@ -32,6 +32,7 @@ use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 /// The player engine. This type is responsible for rendering and the playback.
 pub struct Player {
     sheet_receiver: HeapCons<MidiSheet>,
+    note_off_all_listener: HeapCons<bool>,
     is_playing: Arc<AtomicBool>,
     position: Arc<AtomicUsize>,
     previous_position: usize,
@@ -54,15 +55,18 @@ impl Player {
         let synthesizer = Synthesizer::new(&sf, &settings.clone().into())?;
         let rb = HeapRb::new(1);
         let (sheet_sender, sheet_receiver) = rb.split();
-        let is_playing = Arc::new(false.into());
-        let position = Arc::new(0.into());
+        let rb = HeapRb::new(1);
+        let (note_off_all_sender, note_off_all_listener) = rb.split();
+        let is_playing = Arc::new(AtomicBool::new(false));
+        let position = Arc::new(AtomicUsize::new(0));
         let sample_rate = settings.sample_rate;
 
         Ok((
             Self {
-                is_playing: Arc::clone(&is_playing),
-                position: Arc::clone(&position),
+                is_playing: is_playing.clone(),
+                position: position.clone(),
                 sheet_receiver,
+                note_off_all_listener,
                 settings,
                 synthesizer,
                 sheet: None,
@@ -72,8 +76,10 @@ impl Player {
             PlayerController {
                 is_playing,
                 position,
+                sheet_length: Default::default(),
                 sheet: None,
                 sheet_sender,
+                note_off_all_sender,
                 sample_rate,
             },
         ))
@@ -90,9 +96,18 @@ impl Player {
             panic!("left and right channel buffer size cannot be different");
         }
 
+        if let Some(should_note_off) = self.note_off_all_listener.try_pop() {
+            if should_note_off {
+                self.synthesizer.note_off_all(false);
+                self.synthesizer.render(left, right);
+                return;
+            }
+        }
+
         if !self.is_playing.load(Ordering::Relaxed) {
             return;
         }
+
         if let Some(sheet) = self.sheet_receiver.try_pop() {
             self.sheet = Some(sheet);
         }
@@ -102,6 +117,7 @@ impl Player {
                 let position = self.position.load(Ordering::Relaxed);
                 if position == sheet.pulses.len() {
                     self.is_playing.store(false, Ordering::Relaxed);
+                    self.synthesizer.note_off_all(false);
                     return;
                 }
 
@@ -142,8 +158,11 @@ impl Player {
 pub struct PlayerController {
     is_playing: Arc<AtomicBool>,
     position: Arc<AtomicUsize>,
+    /// This is not the duration, but the number of  pulses in sheet.
+    sheet_length: Arc<AtomicUsize>,
     sheet: Option<MidiSheet>,
     sheet_sender: HeapProd<MidiSheet>,
+    note_off_all_sender: HeapProd<bool>,
     sample_rate: u32,
 }
 
@@ -153,7 +172,7 @@ impl PlayerController {
     /// Retuns `true` if started or already playing; `false` otherwise.
     pub fn play(&self) -> bool {
         if self.sheet.is_none() {
-            self.is_playing.store(false, Ordering::Relaxed);
+            self.is_playing.store(false, Ordering::SeqCst);
             return false;
         }
 
@@ -207,6 +226,29 @@ impl PlayerController {
             .unwrap_or_default()
     }
 
+    /// initialize a new [`PositionObserver`].
+    pub fn new_position_observer(&self) -> PositionObserver {
+        PositionObserver {
+            position: self.position.clone(),
+            length: self.sheet_length.clone(),
+        }
+    }
+
+    /// Set the tempo (in beats per minute).
+    pub fn set_tempo(&self, tempo: f32) {
+        // tempo should be a multiplier of pulse. so we need to extend sheet with `rate` first.
+        // also, we have to keep original tempo inside sheet so we could recalculate it.
+        //
+        // we need only the first tempo and we should not take all the tempo changes into account.
+        // i.e. the tempo for the whole song must to be changed.
+        todo!()
+    }
+
+    /// Get the tempo (in beats per minute).
+    pub fn tempo(&self) -> f32 {
+        todo!()
+    }
+
     /// Get file duration.
     pub fn duration(&self) -> Duration {
         self.sheet
@@ -219,13 +261,36 @@ impl PlayerController {
     pub fn open_file(&mut self, path: &str) -> Result<(), Box<dyn Error>> {
         self.stop();
         let sheet = MidiSheet::new(path, self.sample_rate)?;
+        self.sheet_length
+            .store(sheet.pulses.len(), Ordering::SeqCst);
         self.sheet_sender
             .try_push(sheet.clone())
-            .expect("ringbuf producer should be big enough to handle new files");
+            .expect("ringbuf producer must be big enough to handle new files");
         self.sheet = Some(sheet);
         self.set_position(0.0);
 
         Ok(())
+    }
+
+    /// Send note off message for all notes (aka Panic)
+    pub fn note_off_all(&mut self) {
+        self.note_off_all_sender
+            .try_push(true)
+            .expect("ringbuf must be big enough for sending note off all message");
+    }
+}
+
+/// This type can be used to watch the playhed position and update GUI.
+#[derive(Debug, Clone)]
+pub struct PositionObserver {
+    position: Arc<AtomicUsize>,
+    length: Arc<AtomicUsize>,
+}
+
+impl PositionObserver {
+    /// Get the position
+    pub fn get(&self) -> f32 {
+        self.position.load(Ordering::Relaxed) as f32 / self.length.load(Ordering::Relaxed) as f32
     }
 }
 

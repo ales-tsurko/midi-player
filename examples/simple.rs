@@ -1,26 +1,44 @@
 #![allow(missing_docs)]
 
-use std::error::Error;
+use std::{thread, time::Duration};
 
-use cpal::{StreamConfig, traits::{DeviceTrait, HostTrait, StreamTrait}};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    StreamConfig,
+};
 use midi_player::player::{Player, Settings};
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() {
     let settings = Settings::builder().build();
     let (player, mut controller) =
-        Player::new("examples/Nice-Steinway-Lite-v3.0.sf2", settings)?;
+        Player::new("examples/Nice-Steinway-Lite-v3.0.sf2", settings).unwrap();
 
-    controller.open_file("examples/Sibelius_The_Spruce.mid")?;
+    thread::spawn(|| {
+        start_audio_loop(player);
+    });
 
-    println!(
-        "file duration in seconds: {}",
-        controller.duration().as_secs()
-    );
-    controller.play();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(2));
+        controller
+            .open_file("examples/Sibelius_The_Spruce.mid")
+            .unwrap();
 
-    start_audio_loop(player);
+        println!(
+            "file duration in seconds: {}",
+            controller.duration().as_secs()
+        );
 
-    Ok(())
+        controller.play();
+
+        let position_observer = controller.new_position_observer();
+
+        thread::spawn(move || loop {
+            println!("playhead position is: {}", position_observer.get());
+            thread::sleep(Duration::from_secs(1));
+        });
+    });
+
+    loop {}
 }
 
 fn start_audio_loop(mut player: Player) {
