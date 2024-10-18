@@ -6,6 +6,7 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     StreamConfig,
 };
+use indicatif::{ProgressBar, ProgressStyle};
 use midi_player::player::{Player, Settings};
 
 fn main() {
@@ -17,25 +18,28 @@ fn main() {
         start_audio_loop(player);
     });
 
-    thread::spawn(move || {
-        thread::sleep(Duration::from_secs(2));
-        controller
-            .open_file("examples/Sibelius_The_Spruce.mid")
-            .unwrap();
+    thread::sleep(Duration::from_secs(2));
+    controller
+        .set_file(Some("examples/Sibelius_The_Spruce.mid"))
+        .unwrap();
 
-        println!(
-            "file duration in seconds: {}",
-            controller.duration().as_secs()
+    controller.play();
+
+    let position_observer = controller.new_position_observer();
+
+    thread::spawn(move || {
+        let pb = ProgressBar::new(1000);
+        pb.set_style(
+            ProgressStyle::with_template("{wide_bar:.magenta.on_white/blue.on_white}")
+                .unwrap()
+                .progress_chars("━━-"),
         );
 
-        controller.play();
-
-        let position_observer = controller.new_position_observer();
-
-        thread::spawn(move || loop {
-            println!("playhead position is: {}", position_observer.get());
-            thread::sleep(Duration::from_secs(1));
-        });
+        loop {
+            let position = (1000.0 * position_observer.get()) as u64;
+            pb.set_position(position);
+            thread::sleep(Duration::from_millis(100));
+        }
     });
 
     loop {}

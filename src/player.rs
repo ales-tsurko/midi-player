@@ -31,7 +31,7 @@ use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
 /// The player engine. This type is responsible for rendering and the playback.
 pub struct Player {
-    sheet_receiver: HeapCons<MidiSheet>,
+    sheet_receiver: HeapCons<Option<MidiSheet>>,
     note_off_all_listener: HeapCons<bool>,
     is_playing: Arc<AtomicBool>,
     position: Arc<AtomicUsize>,
@@ -109,7 +109,7 @@ impl Player {
         }
 
         if let Some(sheet) = self.sheet_receiver.try_pop() {
-            self.sheet = Some(sheet);
+            self.sheet = sheet;
         }
 
         if let Some(sheet) = &self.sheet {
@@ -161,7 +161,7 @@ pub struct PlayerController {
     /// This is not the duration, but the number of  pulses in sheet.
     sheet_length: Arc<AtomicUsize>,
     sheet: Option<MidiSheet>,
-    sheet_sender: HeapProd<MidiSheet>,
+    sheet_sender: HeapProd<Option<MidiSheet>>,
     note_off_all_sender: HeapProd<bool>,
     sample_rate: u32,
 }
@@ -257,14 +257,37 @@ impl PlayerController {
             .unwrap_or_default()
     }
 
-    /// Open a MIDI file.
-    pub fn open_file(&mut self, path: &str) -> Result<(), Box<dyn Error>> {
+    /// Set a MIDI file.
+    ///
+    /// The parameter is `Option<&str>`, where `Some` value is actual path and `None` is for
+    /// offloading.
+    pub fn set_file(&mut self, path: Option<&str>) -> Result<(), Box<dyn Error>> {
+        match path {
+            Some(path) => self.open_file(path),
+            None => {
+                self.offload_file();
+                Ok(())
+            }
+        }
+    }
+
+    fn offload_file(&mut self) {
+        self.stop();
+        self.sheet_length.store(0, Ordering::SeqCst);
+        self.sheet_sender
+            .try_push(None)
+            .expect("ringbuf producer must be big enough to handle new files");
+        self.sheet = None;
+        self.set_position(0.0);
+    }
+
+    fn open_file(&mut self, path: &str) -> Result<(), Box<dyn Error>> {
         self.stop();
         let sheet = MidiSheet::new(path, self.sample_rate)?;
         self.sheet_length
             .store(sheet.pulses.len(), Ordering::SeqCst);
         self.sheet_sender
-            .try_push(sheet.clone())
+            .try_push(Some(sheet.clone()))
             .expect("ringbuf producer must be big enough to handle new files");
         self.sheet = Some(sheet);
         self.set_position(0.0);
@@ -290,7 +313,12 @@ pub struct PositionObserver {
 impl PositionObserver {
     /// Get the position
     pub fn get(&self) -> f32 {
-        self.position.load(Ordering::Relaxed) as f32 / self.length.load(Ordering::Relaxed) as f32
+        let length = self.length.load(Ordering::Relaxed);
+        if length == 0 {
+            return 0.0;
+        }
+
+        self.position.load(Ordering::Relaxed) as f32 / length as f32
     }
 }
 
