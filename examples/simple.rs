@@ -52,7 +52,7 @@ fn start_audio_loop(mut player: Player) {
     let device = host
         .default_output_device()
         .expect("No output device available");
-    let channels = 2 as usize;
+    let channels = 2_usize;
     let config = StreamConfig {
         channels: channels as u16,
         sample_rate: cpal::SampleRate(player.settings().sample_rate),
@@ -66,7 +66,7 @@ fn start_audio_loop(mut player: Player) {
 
     let stream = device
         .build_output_stream(
-            &config.into(),
+            &config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let sample_count = data.len() / channels;
 
