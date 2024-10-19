@@ -8,8 +8,9 @@
 //! [`PlayerController`] is supposed to be shared with another thread (i.e. GUI) to control the
 //! player from.
 //!
-//! The API is straightforward. You just initialize [`Player`] and then you can get
-//! [`PlayerController`] using [`Plyaer::controller`] method.
+//! The API is straightforward. You just call [`Player::new`], which initializes a [`Player`] and
+//! [`PlayerController`]. You should run [`Player::render`] within the audio loop and you can
+//! control the player using the initialized controller.
 
 use std::error::Error;
 use std::fs;
@@ -306,6 +307,7 @@ impl PlayerController {
             .try_push(None)
             .expect("ringbuf producer must be big enough to handle new files");
         self.sheet = None;
+        self.tempo_rate.store(1.0, Ordering::Relaxed);
         self.set_position(0.0);
     }
 
@@ -318,6 +320,7 @@ impl PlayerController {
             .try_push(Some(sheet.clone()))
             .expect("ringbuf producer must be big enough to handle new files");
         self.sheet = Some(sheet);
+        self.tempo_rate.store(1.0, Ordering::Relaxed);
         self.set_position(0.0);
 
         Ok(())

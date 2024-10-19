@@ -1,3 +1,3 @@
-#[cfg(feature = "with-gui")]
-pub mod gui;
-pub mod player;
+#![doc = include_str!("../README.md")]
+mod player;
+pub use player::*;
