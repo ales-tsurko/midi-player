@@ -157,10 +157,8 @@ impl Player {
                     * self.tempo_rate.load(Ordering::Relaxed))
                 .round() as u32;
 
-                if self.tick_clock == pulse_duration {
-                    if position < sheet.pulses.len() {
-                        self.position.store(position + 1, Ordering::Relaxed);
-                    }
+                if self.tick_clock == pulse_duration && position < sheet.pulses.len() {
+                    self.position.store(position + 1, Ordering::Relaxed);
                 }
             }
 
@@ -406,8 +404,7 @@ impl MidiSheet {
         let mut duration = Pulse::duration_in_samples(500_000, ppqn as u64, sample_rate as u64);
         let tempo = sheet
             .iter()
-            .map(|m| &m.events)
-            .flatten()
+            .flat_map(|m| &m.events)
             .find(|v| matches!(v, NodiEvent::Tempo(_)))
             .map(|v| match v {
                 NodiEvent::Tempo(tempo) => us_per_beat_to_bpm(*tempo),
@@ -458,7 +455,7 @@ impl Pulse {
             },
             |mut result, event| {
                 match event {
-                    NodiEvent::Midi(event) => result.events.push(event.clone().into()),
+                    NodiEvent::Midi(event) => result.events.push((*event).into()),
                     NodiEvent::Tempo(tempo) => {
                         *duration = Self::duration_in_samples(
                             *tempo as u64,
@@ -509,8 +506,8 @@ impl From<MidiEvent> for RawMidiEvent {
                 let midi_value = bend.as_int() as i32 + 8192;
 
                 // Extract LSB and MSB data bytes
-                let lsb = (midi_value & 0x7F) as i32;
-                let msb = ((midi_value >> 7) & 0x7F) as i32;
+                let lsb = midi_value & 0x7F;
+                let msb = (midi_value >> 7) & 0x7F;
 
                 (0xE0, lsb, msb)
             }

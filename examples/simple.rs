@@ -7,7 +7,7 @@ use cpal::{
     StreamConfig,
 };
 use indicatif::{ProgressBar, ProgressStyle};
-use midi_player::player::{Player, Settings};
+use midi_player::{Player, Settings};
 
 fn main() {
     let settings = Settings::builder().build();
