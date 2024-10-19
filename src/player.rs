@@ -1,16 +1,15 @@
 //! GUI-independent player implementation.
 //!
-//! It contains of the player itself [`Player`] and its controller [`PlayerController`].
+//! It contains the player itself [`Player`] and its controller [`PlayerController`].
 //!
-//! [`Player`] is responsible for rendering, and can be moved to the audio thread to provide audio
-//! buffers inside the audio loop.
+//! [`Player`] is responsible for rendering, and can be moved to the audio thread to fill the audio
+//! buffers with samples.
 //!
 //! [`PlayerController`] is supposed to be shared with another thread (i.e. GUI) to control the
 //! player from.
 //!
 //! The API is straightforward. You just initialize [`Player`] and then you can get
-//! [`PlayerController`] using [`Plyaer::controller`] method. The controller is cheap to clone and
-//! safe to share between threads.
+//! [`PlayerController`] using [`Plyaer::controller`] method.
 
 use std::error::Error;
 use std::fs;
@@ -34,6 +33,7 @@ use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 pub struct Player {
     sheet_receiver: HeapCons<Option<MidiSheet>>,
     tempo_rate: Arc<AtomicF32>,
+    volume: Arc<AtomicF32>,
     note_off_all_listener: HeapCons<bool>,
     is_playing: Arc<AtomicBool>,
     position: Arc<AtomicUsize>,
@@ -63,12 +63,14 @@ impl Player {
         let position = Arc::new(AtomicUsize::new(0));
         let sample_rate = settings.sample_rate;
         let tempo_rate = Arc::new(AtomicF32::new(1.0));
+        let volume = Arc::new(AtomicF32::new(1.0));
 
         Ok((
             Self {
                 is_playing: is_playing.clone(),
                 position: position.clone(),
                 tempo_rate: tempo_rate.clone(),
+                volume: volume.clone(),
                 sheet_receiver,
                 note_off_all_listener,
                 settings,
@@ -81,6 +83,7 @@ impl Player {
                 is_playing,
                 position,
                 tempo_rate,
+                volume,
                 sheet_length: Default::default(),
                 sheet: None,
                 sheet_sender,
@@ -118,6 +121,8 @@ impl Player {
         }
 
         if let Some(sheet) = &self.sheet {
+            self.synthesizer
+                .set_master_volume(self.volume.load(Ordering::Relaxed));
             for _ in 0..left.len() {
                 let position = self.position.load(Ordering::Relaxed);
                 if position == sheet.pulses.len() {
@@ -168,6 +173,7 @@ pub struct PlayerController {
     is_playing: Arc<AtomicBool>,
     position: Arc<AtomicUsize>,
     tempo_rate: Arc<AtomicF32>,
+    volume: Arc<AtomicF32>,
     /// This is not the duration, but the number of  pulses in sheet.
     sheet_length: Arc<AtomicUsize>,
     sheet: Option<MidiSheet>,
@@ -259,6 +265,16 @@ impl PlayerController {
         self.sheet
             .as_ref()
             .map(|s| s.tempo / self.tempo_rate.load(Ordering::SeqCst))
+    }
+
+    /// Set master volume.
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume.store(volume.max(0.0), Ordering::Relaxed);
+    }
+
+    /// Get master volume.
+    pub fn volume(&self) -> f32 {
+        self.volume.load(Ordering::Relaxed)
     }
 
     /// Get file duration.

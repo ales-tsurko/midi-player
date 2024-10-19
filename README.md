@@ -3,7 +3,8 @@ midi-player
 
 A MIDI file player library with integrated synthesizer ([`rustysynth`](https://crates.io/crates/rustysynth)).
 
-It's independent of audio library and provides optional GUI written in **iced**.
+It's independent from audio library and provides optional GUI written in
+**iced**.
 
 Has all the basic features: play/stop, position, volume, tempo parameters and
 position observer, which allows you to track playhead position in the real-time. 
