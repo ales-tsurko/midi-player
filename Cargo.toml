@@ -7,6 +7,10 @@ description = "A MIDI file player library with integrated synthesizer"
 readme = "README.md"
 repository = "https://github.com/ales-tsurko/midi-player"
 license-file = "LICENSE"
+exclude = [
+    "examples/Nice-Steinway-Lite-v3.0.sf2",
+    "examples/Sibelius_The_Spruce.mid",
+]
 
 [dependencies]
 atomic_float = "1.1.0"
