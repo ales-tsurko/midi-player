@@ -25,6 +25,8 @@ fn main() {
 
     controller.play();
 
+    println!("tempo: {:.2} BPM", controller.tempo().unwrap());
+
     let position_observer = controller.new_position_observer();
 
     thread::spawn(move || {

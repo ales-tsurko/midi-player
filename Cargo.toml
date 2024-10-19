@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+atomic_float = "1.1.0"
 bon = "2.3.0"
 iced = { version = "0.13.1", features = ["wgpu"], optional = true }
 nodi = "1.0.1"

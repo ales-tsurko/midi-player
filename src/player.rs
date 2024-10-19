@@ -20,6 +20,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use atomic_float::AtomicF32;
 use bon::{builder, Builder};
 use nodi::{
     midly::{Format, MidiMessage, Smf, Timing},
@@ -32,6 +33,7 @@ use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 /// The player engine. This type is responsible for rendering and the playback.
 pub struct Player {
     sheet_receiver: HeapCons<Option<MidiSheet>>,
+    tempo_rate: Arc<AtomicF32>,
     note_off_all_listener: HeapCons<bool>,
     is_playing: Arc<AtomicBool>,
     position: Arc<AtomicUsize>,
@@ -60,11 +62,13 @@ impl Player {
         let is_playing = Arc::new(AtomicBool::new(false));
         let position = Arc::new(AtomicUsize::new(0));
         let sample_rate = settings.sample_rate;
+        let tempo_rate = Arc::new(AtomicF32::new(1.0));
 
         Ok((
             Self {
                 is_playing: is_playing.clone(),
                 position: position.clone(),
+                tempo_rate: tempo_rate.clone(),
                 sheet_receiver,
                 note_off_all_listener,
                 settings,
@@ -76,6 +80,7 @@ impl Player {
             PlayerController {
                 is_playing,
                 position,
+                tempo_rate,
                 sheet_length: Default::default(),
                 sheet: None,
                 sheet_sender,
@@ -142,7 +147,11 @@ impl Player {
 
                 self.tick_clock += 1;
 
-                if self.tick_clock == pulse.duration {
+                let pulse_duration = (pulse.duration as f32
+                    * self.tempo_rate.load(Ordering::Relaxed))
+                .round() as u32;
+
+                if self.tick_clock == pulse_duration {
                     if position < sheet.pulses.len() {
                         self.position.store(position + 1, Ordering::Relaxed);
                     }
@@ -158,6 +167,7 @@ impl Player {
 pub struct PlayerController {
     is_playing: Arc<AtomicBool>,
     position: Arc<AtomicUsize>,
+    tempo_rate: Arc<AtomicF32>,
     /// This is not the duration, but the number of  pulses in sheet.
     sheet_length: Arc<AtomicUsize>,
     sheet: Option<MidiSheet>,
@@ -235,18 +245,20 @@ impl PlayerController {
     }
 
     /// Set the tempo (in beats per minute).
-    pub fn set_tempo(&self, tempo: f32) {
-        // tempo should be a multiplier of pulse. so we need to extend sheet with `rate` first.
-        // also, we have to keep original tempo inside sheet so we could recalculate it.
-        //
-        // we need only the first tempo and we should not take all the tempo changes into account.
-        // i.e. the tempo for the whole song must to be changed.
-        todo!()
+    pub fn set_tempo(&mut self, tempo: f32) {
+        if let Some(sheet) = &mut self.sheet {
+            self.tempo_rate
+                .store(sheet.tempo / tempo, Ordering::Relaxed);
+        }
     }
 
     /// Get the tempo (in beats per minute).
-    pub fn tempo(&self) -> f32 {
-        todo!()
+    ///
+    /// Returns `None` if file is not set.
+    pub fn tempo(&self) -> Option<f32> {
+        self.sheet
+            .as_ref()
+            .map(|s| s.tempo / self.tempo_rate.load(Ordering::SeqCst))
     }
 
     /// Get file duration.
@@ -322,9 +334,38 @@ impl PositionObserver {
     }
 }
 
+/// The player settings.
+#[allow(missing_docs)]
+#[derive(Builder, Clone, Debug)]
+pub struct Settings {
+    #[builder(default = 44100)]
+    pub sample_rate: u32,
+    #[builder(default = 64)]
+    pub block_size: u32,
+    #[builder(default = 512)]
+    pub audio_buffer_size: u32,
+    #[builder(default = 64)]
+    pub max_polyphony: u8,
+    #[builder(default = true)]
+    pub enable_effects: bool,
+}
+
+impl From<Settings> for SynthesizerSettings {
+    fn from(settings: Settings) -> Self {
+        // SynthesizerSettings is a non-exhaustive struct, so struct expressions not allowed
+        let mut result = SynthesizerSettings::new(settings.sample_rate as i32);
+        result.block_size = settings.block_size as usize;
+        result.maximum_polyphony = settings.max_polyphony as usize;
+        result.enable_reverb_and_chorus = settings.enable_effects;
+
+        result
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MidiSheet {
     sample_rate: u32,
+    tempo: f32,
     // pulses per quarter note
     pulses: Vec<Pulse>,
 }
@@ -344,6 +385,16 @@ impl MidiSheet {
         };
 
         let mut duration = Pulse::duration_in_samples(500_000, ppqn as u64, sample_rate as u64);
+        let tempo = sheet
+            .iter()
+            .map(|m| &m.events)
+            .flatten()
+            .find(|v| matches!(v, NodiEvent::Tempo(_)))
+            .map(|v| match v {
+                NodiEvent::Tempo(tempo) => us_per_beat_to_bpm(*tempo),
+                _ => unreachable!(),
+            })
+            .unwrap_or(120.0f32);
 
         let pulses = sheet
             .iter()
@@ -353,6 +404,7 @@ impl MidiSheet {
         Ok(Self {
             sample_rate,
             pulses,
+            tempo,
         })
     }
 
@@ -362,6 +414,10 @@ impl MidiSheet {
 
         Duration::from_micros(duration as u64)
     }
+}
+
+fn us_per_beat_to_bpm(uspb: u32) -> f32 {
+    60.0 / uspb as f32 * 1_000_000.0
 }
 
 #[derive(Debug, Clone)]
@@ -447,33 +503,5 @@ impl From<MidiEvent> for RawMidiEvent {
             data1,
             data2,
         }
-    }
-}
-
-/// The player settings.
-#[allow(missing_docs)]
-#[derive(Builder, Clone, Debug)]
-pub struct Settings {
-    #[builder(default = 44100)]
-    pub sample_rate: u32,
-    #[builder(default = 64)]
-    pub block_size: u32,
-    #[builder(default = 512)]
-    pub audio_buffer_size: u32,
-    #[builder(default = 64)]
-    pub max_polyphony: u8,
-    #[builder(default = true)]
-    pub enable_effects: bool,
-}
-
-impl From<Settings> for SynthesizerSettings {
-    fn from(settings: Settings) -> Self {
-        // SynthesizerSettings is a non-exhaustive struct, so struct expressions not allowed
-        let mut result = SynthesizerSettings::new(settings.sample_rate as i32);
-        result.block_size = settings.block_size as usize;
-        result.maximum_polyphony = settings.max_polyphony as usize;
-        result.enable_reverb_and_chorus = settings.enable_effects;
-
-        result
     }
 }
