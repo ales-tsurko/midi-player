@@ -1,6 +1,6 @@
 [package]
 name = "midi-player"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Ales Tsurko <ales.tsurko@gmail.com>"]
 description = "A MIDI file player library with integrated synthesizer"
