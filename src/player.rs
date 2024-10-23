@@ -12,13 +12,16 @@
 //! [`PlayerController`]. You should run [`Player::render`] within the audio loop and you can
 //! control the player using the initialized controller.
 
+use std::collections::HashMap;
 use std::error::Error;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use atomic_float::AtomicF32;
 use bon::{builder, Builder};
@@ -32,7 +35,7 @@ use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
 /// The player engine. This type is responsible for rendering and the playback.
 pub struct Player {
-    sheet_receiver: HeapCons<Option<MidiSheet>>,
+    sheet_receiver: HeapCons<Option<Arc<MidiSheet>>>,
     tempo_rate: Arc<AtomicF32>,
     volume: Arc<AtomicF32>,
     note_off_all_listener: HeapCons<bool>,
@@ -40,10 +43,9 @@ pub struct Player {
     position: Arc<AtomicUsize>,
     previous_position: usize,
     settings: Settings,
-    sheet: Option<MidiSheet>,
+    sheet: Option<Arc<MidiSheet>>,
     synthesizer: Synthesizer,
-    // clock in samples within a single tick
-    tick_clock: u32,
+    tick_clock: u32, // clock in samples within a single tick
 }
 
 impl Player {
@@ -89,7 +91,7 @@ impl Player {
                 sheet: None,
                 sheet_sender,
                 note_off_all_sender,
-                sample_rate,
+                cache: Cache::new(sample_rate),
             },
         ))
     }
@@ -175,10 +177,10 @@ pub struct PlayerController {
     volume: Arc<AtomicF32>,
     /// This is not the duration, but the number of  pulses in sheet.
     sheet_length: Arc<AtomicUsize>,
-    sheet: Option<MidiSheet>,
-    sheet_sender: HeapProd<Option<MidiSheet>>,
+    sheet: Option<Arc<MidiSheet>>,
+    sheet_sender: HeapProd<Option<Arc<MidiSheet>>>,
     note_off_all_sender: HeapProd<bool>,
-    sample_rate: u32,
+    cache: Cache,
 }
 
 impl PlayerController {
@@ -288,7 +290,7 @@ impl PlayerController {
     ///
     /// The parameter is `Option<&str>`, where `Some` value is actual path and `None` is for
     /// offloading.
-    pub fn set_file(&mut self, path: Option<&str>) -> Result<(), Box<dyn Error>> {
+    pub fn set_file(&mut self, path: Option<impl Into<PathBuf>>) -> Result<(), Box<dyn Error>> {
         match path {
             Some(path) => self.open_file(path),
             None => {
@@ -309,9 +311,9 @@ impl PlayerController {
         self.set_position(0.0);
     }
 
-    fn open_file(&mut self, path: &str) -> Result<(), Box<dyn Error>> {
+    fn open_file(&mut self, path: impl Into<PathBuf>) -> Result<(), Box<dyn Error>> {
         self.stop();
-        let sheet = MidiSheet::new(path, self.sample_rate)?;
+        let sheet = self.cache.open(&path.into())?;
         self.sheet_length
             .store(sheet.pulses.len(), Ordering::SeqCst);
         self.sheet_sender
@@ -329,6 +331,43 @@ impl PlayerController {
         self.note_off_all_sender
             .try_push(true)
             .expect("ringbuf must be big enough for sending note off all message");
+    }
+}
+
+struct Cache {
+    sample_rate: u32,
+    map: HashMap<PathBuf, Arc<MidiSheet>>,
+}
+
+impl Cache {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            sample_rate,
+            map: HashMap::new(),
+        }
+    }
+
+    fn open(&mut self, path: &PathBuf) -> Result<Arc<MidiSheet>, Box<dyn Error>> {
+        let file = File::open(path)?;
+
+        match self.map.get(path) {
+            Some(s) => {
+                if file.metadata()?.modified()? == s.modified {
+                    Ok(s.clone())
+                } else {
+                    self.upsert(path, file)
+                }
+            }
+
+            None => self.upsert(path, file),
+        }
+    }
+
+    fn upsert(&mut self, path: &PathBuf, file: File) -> Result<Arc<MidiSheet>, Box<dyn Error>> {
+        let sheet = Arc::new(MidiSheet::new(file, self.sample_rate)?);
+        self.map.insert(path.clone(), sheet.clone());
+
+        Ok(sheet)
     }
 }
 
@@ -385,12 +424,15 @@ struct MidiSheet {
     tempo: f32,
     // pulses per quarter note
     pulses: Vec<Pulse>,
+    modified: SystemTime,
 }
 
 impl MidiSheet {
-    fn new(file: &str, sample_rate: u32) -> Result<Self, Box<dyn Error>> {
-        let file = fs::read(file)?;
-        let Smf { header, tracks } = Smf::parse(&file)?;
+    fn new(mut file: File, sample_rate: u32) -> Result<Self, Box<dyn Error>> {
+        let modified = file.metadata()?.modified()?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        let Smf { header, tracks } = Smf::parse(&buf)?;
         let ppqn = match header.timing {
             Timing::Metrical(n) => u16::from(n),
             _ => return Err(TimeFormatError.into()),
@@ -421,6 +463,7 @@ impl MidiSheet {
             sample_rate,
             pulses,
             tempo,
+            modified,
         })
     }
 
