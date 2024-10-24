@@ -29,6 +29,14 @@ fn main() {
 
     let position_observer = controller.new_position_observer();
 
+    // check releases on play/stop toggle
+    // thread::spawn(move || loop {
+    //     thread::sleep(Duration::from_secs(2));
+    //     controller.stop();
+    //     thread::sleep(Duration::from_secs(1));
+    //     controller.play();
+    // });
+
     thread::spawn(move || {
         let pb = ProgressBar::new(1000);
         pb.set_style(

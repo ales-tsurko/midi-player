@@ -116,6 +116,7 @@ impl Player {
         }
 
         if !self.is_playing.load(Ordering::Relaxed) {
+            self.synthesizer.render(left, right);
             return;
         }
 
@@ -215,9 +216,10 @@ impl PlayerController {
     }
 
     /// Stop the playback.
-    pub fn stop(&self) {
+    pub fn stop(&mut self) {
         if self.is_playing() {
             self.is_playing.store(false, Ordering::SeqCst);
+            self.note_off_all();
         }
     }
 
