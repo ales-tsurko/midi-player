@@ -24,7 +24,7 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 use atomic_float::AtomicF32;
-use bon::{builder, Builder};
+use bon::Builder;
 use nodi::{
     midly::{Format, MidiMessage, Smf, Timing},
     timers::TimeFormatError,
@@ -176,7 +176,7 @@ pub struct PlayerController {
     position: Arc<AtomicUsize>,
     tempo_rate: Arc<AtomicF32>,
     volume: Arc<AtomicF32>,
-    /// This is not the duration, but the number of  pulses in sheet.
+    /// The sheet length in timeline ticks.
     sheet_length: Arc<AtomicUsize>,
     sheet: Option<Arc<MidiSheet>>,
     sheet_sender: HeapProd<Option<Arc<MidiSheet>>>,
@@ -187,7 +187,7 @@ pub struct PlayerController {
 impl PlayerController {
     /// Start the playback.
     ///
-    /// Retuns `true` if started or already playing; `false` otherwise.
+    /// Returns `true` if started or already playing; `false` otherwise.
     pub fn play(&self) -> bool {
         if self.sheet.is_none() {
             self.is_playing.store(false, Ordering::SeqCst);
@@ -223,29 +223,56 @@ impl PlayerController {
         }
     }
 
-    /// Set the playing position. In range [0.0, 1.0].
+    /// Set the playing position in timeline ticks.
     ///
-    /// Will take effect only if a file is opened and it's not empty.
-    pub fn set_position(&self, value: f64) {
-        if let Some(sheet) = &self.sheet {
-            let position = value.max(0.0).min(1.0);
-            let position = (sheet.pulses.len() as f64 * position) as usize;
-            self.position.store(position, Ordering::Relaxed);
+    /// Values outside the valid range are clamped to `[0, total_ticks()]`. Will take effect only if
+    /// a file is opened and it is not empty.
+    pub fn set_position_ticks(&self, value: u64) {
+        let length = self.sheet_length.load(Ordering::Relaxed);
+        if length == 0 {
+            return;
         }
+
+        let tick = value.min(length as u64) as usize;
+        self.position.store(tick, Ordering::Relaxed);
     }
 
-    /// Get normalized pkaying position (i.e. in range [0.0, 1.0]).
+    /// Get the current playback position in timeline ticks.
+    pub fn position_ticks(&self) -> u64 {
+        self.position.load(Ordering::Relaxed) as u64
+    }
+
+    /// Get the total number of timeline ticks in the loaded file.
+    pub fn total_ticks(&self) -> u64 {
+        self.sheet_length.load(Ordering::Relaxed) as u64
+    }
+
+    /// Set the playing position in normalized range `[0.0, 1.0]`.
+    ///
+    /// Will take effect only if a file is opened and it is not empty.
+    pub fn set_position(&self, value: f64) {
+        let total_ticks = self.total_ticks();
+        if total_ticks == 0 {
+            return;
+        }
+
+        let position = value.max(0.0).min(1.0);
+        let tick = (total_ticks as f64 * position) as u64;
+        self.set_position_ticks(tick);
+    }
+
+    /// Get normalized playing position (i.e. in range [0.0, 1.0]).
     pub fn position(&self) -> f64 {
-        self.sheet
-            .as_ref()
-            .map(|sheet| {
-                let position = self.position.load(Ordering::Relaxed) as f64;
-                (position / sheet.pulses.len() as f64).max(0.0).min(1.0)
-            })
-            .unwrap_or_default()
+        let total_ticks = self.total_ticks();
+        if total_ticks == 0 {
+            return 0.0;
+        }
+
+        let position = self.position_ticks() as f64;
+        (position / total_ticks as f64).max(0.0).min(1.0)
     }
 
-    /// initialize a new [`PositionObserver`].
+    /// Initialize a new [`PositionObserver`].
     pub fn new_position_observer(&self) -> PositionObserver {
         PositionObserver {
             position: self.position.clone(),
@@ -316,8 +343,7 @@ impl PlayerController {
     fn open_file(&mut self, path: impl Into<PathBuf>) -> Result<(), Box<dyn Error>> {
         self.stop();
         let sheet = self.cache.open(&path.into())?;
-        self.sheet_length
-            .store(sheet.pulses.len(), Ordering::SeqCst);
+        self.sheet_length.store(sheet.total_ticks, Ordering::SeqCst);
         self.sheet_sender
             .try_push(Some(sheet.clone()))
             .expect("ringbuf producer must be big enough to handle new files");
@@ -373,7 +399,7 @@ impl Cache {
     }
 }
 
-/// This type can be used to watch the playhed position and update GUI.
+/// This type can be used to watch the playback position and update the GUI.
 #[derive(Debug, Clone)]
 pub struct PositionObserver {
     position: Arc<AtomicUsize>,
@@ -381,7 +407,7 @@ pub struct PositionObserver {
 }
 
 impl PositionObserver {
-    /// Get the position
+    /// Get the normalized playback position in range `[0.0, 1.0]`.
     pub fn get(&self) -> f32 {
         let length = self.length.load(Ordering::Relaxed);
         if length == 0 {
@@ -389,6 +415,16 @@ impl PositionObserver {
         }
 
         self.position.load(Ordering::Relaxed) as f32 / length as f32
+    }
+
+    /// Get the current playback position in timeline ticks.
+    pub fn ticks(&self) -> u64 {
+        self.position.load(Ordering::Relaxed) as u64
+    }
+
+    /// Get the total number of timeline ticks in the loaded file.
+    pub fn total_ticks(&self) -> u64 {
+        self.length.load(Ordering::Relaxed) as u64
     }
 }
 
@@ -424,8 +460,9 @@ impl From<Settings> for SynthesizerSettings {
 struct MidiSheet {
     sample_rate: u32,
     tempo: f32,
-    // pulses per quarter note
+    // One pulse per MIDI tick (nodi::Moment).
     pulses: Vec<Pulse>,
+    total_ticks: usize,
     modified: SystemTime,
 }
 
@@ -444,6 +481,7 @@ impl MidiSheet {
             Format::SingleTrack | Format::Sequential => Sheet::sequential(&tracks),
             Format::Parallel => Sheet::parallel(&tracks),
         };
+        let total_ticks = sheet.len();
 
         let mut duration = Pulse::duration_in_samples(500_000, ppqn as u64, sample_rate as u64);
         let tempo = sheet
@@ -456,14 +494,16 @@ impl MidiSheet {
             })
             .unwrap_or(120.0f32);
 
-        let pulses = sheet
+        let pulses: Vec<Pulse> = sheet
             .iter()
             .map(|moment| Pulse::from_moment(moment, &mut duration, ppqn, sample_rate))
             .collect();
+        debug_assert_eq!(pulses.len(), total_ticks);
 
         Ok(Self {
             sample_rate,
             pulses,
+            total_ticks,
             tempo,
             modified,
         })

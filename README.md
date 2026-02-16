@@ -1,13 +1,14 @@
 midi-player
 ===========
 
-A MIDI file player library with integrated synthesizer ([`rustysynth`](https://crates.io/crates/rustysynth)).
+A MIDI file player library with integrated synthesizer
+([`rustysynth`](https://crates.io/crates/rustysynth)).
 
-It's independent from audio library, that means you should provide your own
+It is independent of any audio library, which means you should provide your own
 audio loop and run the render function within it.
 
 The player has play/stop, position, volume and tempo parameters, and position
-observer, which allows you to track the play position in the real-time. 
+observer, which allows you to track the playback position in real time.
 
 
 
@@ -15,14 +16,14 @@ observer, which allows you to track the play position in the real-time.
 ## Example usage (with `cpal`)
 
 
-```rust
+```no_run
 use std::{thread, time::Duration};
 
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     StreamConfig,
 };
-use midi_player::player::{Player, Settings};
+use midi_player::{Player, Settings};
 
 fn main() {
     let settings = Settings::builder().build();
