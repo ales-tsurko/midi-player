@@ -10,6 +10,9 @@ audio loop and run the render function within it.
 The player has play/stop, position, volume and tempo parameters, and position
 observer, which allows you to track the playback position in real time.
 
+It also exposes track metadata and track-level mute/solo controls, so clients
+can build per-track visibility or transport controls in a DAW-like UI.
+
 
 
 
@@ -86,4 +89,26 @@ fn start_audio_loop(mut player: Player) {
 
     std::thread::park();
 }
+```
+
+## Track mute/solo
+
+After loading a file, you can inspect tracks and control their playback state:
+
+```rust,no_run
+# use midi_player::{Player, Settings};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+# let (_player, mut controller) = Player::new("examples/Nice-Steinway-Lite-v3.0.sf2", Settings::builder().build())?;
+# controller.set_file(Some("examples/Sibelius_The_Spruce.mid"))?;
+for track in controller.track_infos() {
+    println!(
+        "track {} {:?} channels={:?} programs={:?}",
+        track.index, track.name, track.channels, track.programs
+    );
+}
+
+controller.set_track_muted(2, true);
+controller.set_track_solo(4, true);
+# Ok(())
+# }
 ```

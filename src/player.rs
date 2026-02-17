@@ -12,7 +12,7 @@
 //! [`PlayerController`]. You should run [`Player::render`] within the audio loop and you can
 //! control the player using the initialized controller.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::Read;
@@ -26,9 +26,8 @@ use std::time::{Duration, SystemTime};
 use atomic_float::AtomicF32;
 use bon::Builder;
 use nodi::{
-    midly::{Format, MidiMessage, Smf, Timing},
+    midly::{MetaMessage, MidiMessage, Smf, Timing, TrackEventKind},
     timers::TimeFormatError,
-    Event as NodiEvent, MidiEvent, Moment, Sheet,
 };
 use ringbuf::{traits::*, HeapCons, HeapProd, HeapRb};
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
@@ -36,6 +35,7 @@ use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 /// The player engine. This type is responsible for rendering and the playback.
 pub struct Player {
     sheet_receiver: HeapCons<Option<Arc<MidiSheet>>>,
+    track_filter_listener: HeapCons<TrackFilter>,
     tempo_rate: Arc<AtomicF32>,
     volume: Arc<AtomicF32>,
     note_off_all_listener: HeapCons<bool>,
@@ -44,6 +44,7 @@ pub struct Player {
     previous_position: usize,
     settings: Settings,
     sheet: Option<Arc<MidiSheet>>,
+    track_filter: TrackFilter,
     synthesizer: Synthesizer,
     tick_clock: u32, // clock in samples within a single tick
 }
@@ -60,6 +61,8 @@ impl Player {
         let synthesizer = Synthesizer::new(&sf, &settings.clone().into())?;
         let rb = HeapRb::new(1);
         let (sheet_sender, sheet_receiver) = rb.split();
+        let rb = HeapRb::new(64);
+        let (track_filter_sender, track_filter_listener) = rb.split();
         let rb = HeapRb::new(1);
         let (note_off_all_sender, note_off_all_listener) = rb.split();
         let is_playing = Arc::new(AtomicBool::new(false));
@@ -75,10 +78,12 @@ impl Player {
                 tempo_rate: tempo_rate.clone(),
                 volume: volume.clone(),
                 sheet_receiver,
+                track_filter_listener,
                 note_off_all_listener,
                 settings,
                 synthesizer,
                 sheet: None,
+                track_filter: TrackFilter::new(0),
                 tick_clock: 0,
                 previous_position: 0,
             },
@@ -90,6 +95,8 @@ impl Player {
                 sheet_length: Default::default(),
                 sheet: None,
                 sheet_sender,
+                track_filter_sender,
+                track_filter: TrackFilter::new(0),
                 note_off_all_sender,
                 cache: Cache::new(sample_rate),
             },
@@ -123,6 +130,9 @@ impl Player {
         if let Some(sheet) = self.sheet_receiver.try_pop() {
             self.sheet = sheet;
         }
+        if let Some(track_filter) = self.track_filter_listener.try_pop() {
+            self.track_filter = track_filter;
+        }
 
         if let Some(sheet) = &self.sheet {
             self.synthesizer
@@ -145,6 +155,9 @@ impl Player {
 
                 if self.tick_clock == 0 {
                     for event in &pulse.events {
+                        if !self.track_filter.allows(event.track_index) {
+                            continue;
+                        }
                         self.synthesizer.process_midi_message(
                             event.channel,
                             event.command,
@@ -180,6 +193,8 @@ pub struct PlayerController {
     sheet_length: Arc<AtomicUsize>,
     sheet: Option<Arc<MidiSheet>>,
     sheet_sender: HeapProd<Option<Arc<MidiSheet>>>,
+    track_filter_sender: HeapProd<TrackFilter>,
+    track_filter: TrackFilter,
     note_off_all_sender: HeapProd<bool>,
     cache: Cache,
 }
@@ -210,7 +225,7 @@ impl PlayerController {
         true
     }
 
-    ///
+    /// Returns `true` when playback is active.
     pub fn is_playing(&self) -> bool {
         self.is_playing.load(Ordering::SeqCst)
     }
@@ -315,6 +330,84 @@ impl PlayerController {
             .unwrap_or_default()
     }
 
+    /// Returns metadata for all tracks in the loaded file.
+    pub fn track_infos(&self) -> Vec<MidiTrackInfo> {
+        self.sheet
+            .as_ref()
+            .map(|sheet| sheet.track_infos.clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns the number of tracks in the loaded file.
+    pub fn track_count(&self) -> usize {
+        self.sheet
+            .as_ref()
+            .map(|sheet| sheet.track_infos.len())
+            .unwrap_or(0)
+    }
+
+    /// Mute or unmute a track by its index.
+    ///
+    /// Returns `true` if the state changed.
+    pub fn set_track_muted(&mut self, track_index: usize, muted: bool) -> bool {
+        let changed = self.track_filter.set_muted(track_index, muted);
+        if changed {
+            self.publish_track_filter();
+            self.note_off_all();
+        }
+        changed
+    }
+
+    /// Returns whether a track is muted.
+    ///
+    /// Returns `None` if `track_index` is out of bounds.
+    pub fn is_track_muted(&self, track_index: usize) -> Option<bool> {
+        self.track_filter.is_muted(track_index)
+    }
+
+    /// Clears mute state for all tracks.
+    ///
+    /// Returns `true` if any state changed.
+    pub fn clear_track_mutes(&mut self) -> bool {
+        let changed = self.track_filter.clear_mutes();
+        if changed {
+            self.publish_track_filter();
+            self.note_off_all();
+        }
+        changed
+    }
+
+    /// Solo or unsolo a track by its index.
+    ///
+    /// Returns `true` if the state changed.
+    pub fn set_track_solo(&mut self, track_index: usize, soloed: bool) -> bool {
+        let changed = self.track_filter.set_solo(track_index, soloed);
+        if changed {
+            self.publish_track_filter();
+            self.note_off_all();
+        }
+        changed
+    }
+
+    /// Returns whether a track is soloed.
+    ///
+    /// Returns `None` if `track_index` is out of bounds.
+    pub fn is_track_solo(&self, track_index: usize) -> Option<bool> {
+        self.track_filter.is_solo(track_index)
+    }
+
+    /// Clears solo state for all tracks.
+    ///
+    /// Returns `true` if any state changed.
+    pub fn clear_track_solos(&mut self) -> bool {
+        let changed = self.track_filter.clear_solos();
+        if changed {
+            self.publish_track_filter();
+            self.note_off_all();
+        }
+        changed
+    }
+
     /// Set a MIDI file.
     ///
     /// The parameter is `Option<&str>`, where `Some` value is actual path and `None` is for
@@ -336,6 +429,8 @@ impl PlayerController {
             .try_push(None)
             .expect("ringbuf producer must be big enough to handle new files");
         self.sheet = None;
+        self.track_filter = TrackFilter::new(0);
+        self.publish_track_filter();
         self.tempo_rate.store(1.0, Ordering::Relaxed);
         self.set_position(0.0);
     }
@@ -348,6 +443,8 @@ impl PlayerController {
             .try_push(Some(sheet.clone()))
             .expect("ringbuf producer must be big enough to handle new files");
         self.sheet = Some(sheet);
+        self.track_filter = TrackFilter::new(self.track_count());
+        self.publish_track_filter();
         self.tempo_rate.store(1.0, Ordering::Relaxed);
         self.set_position(0.0);
 
@@ -359,6 +456,97 @@ impl PlayerController {
         self.note_off_all_sender
             .try_push(true)
             .expect("ringbuf must be big enough for sending note off all message");
+    }
+
+    fn publish_track_filter(&mut self) {
+        let _ = self.track_filter_sender.try_push(self.track_filter.clone());
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TrackFilter {
+    muted: Vec<bool>,
+    soloed: Vec<bool>,
+    solo_count: usize,
+}
+
+impl TrackFilter {
+    fn new(track_count: usize) -> Self {
+        Self {
+            muted: vec![false; track_count],
+            soloed: vec![false; track_count],
+            solo_count: 0,
+        }
+    }
+
+    fn set_muted(&mut self, track_index: usize, muted: bool) -> bool {
+        let Some(current) = self.muted.get_mut(track_index) else {
+            return false;
+        };
+        if *current == muted {
+            return false;
+        }
+
+        *current = muted;
+        true
+    }
+
+    fn is_muted(&self, track_index: usize) -> Option<bool> {
+        self.muted.get(track_index).copied()
+    }
+
+    fn clear_mutes(&mut self) -> bool {
+        let mut changed = false;
+        for muted in &mut self.muted {
+            if *muted {
+                *muted = false;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    fn set_solo(&mut self, track_index: usize, soloed: bool) -> bool {
+        let Some(current) = self.soloed.get_mut(track_index) else {
+            return false;
+        };
+        if *current == soloed {
+            return false;
+        }
+
+        *current = soloed;
+        if soloed {
+            self.solo_count += 1;
+        } else {
+            self.solo_count = self.solo_count.saturating_sub(1);
+        }
+        true
+    }
+
+    fn is_solo(&self, track_index: usize) -> Option<bool> {
+        self.soloed.get(track_index).copied()
+    }
+
+    fn clear_solos(&mut self) -> bool {
+        if self.solo_count == 0 {
+            return false;
+        }
+
+        for soloed in &mut self.soloed {
+            *soloed = false;
+        }
+        self.solo_count = 0;
+        true
+    }
+
+    fn allows(&self, track_index: usize) -> bool {
+        let muted = self.muted.get(track_index).copied().unwrap_or(false);
+        let soloed = self.soloed.get(track_index).copied().unwrap_or(false);
+        if self.solo_count > 0 {
+            soloed && !muted
+        } else {
+            !muted
+        }
     }
 }
 
@@ -456,6 +644,19 @@ impl From<Settings> for SynthesizerSettings {
     }
 }
 
+/// MIDI track metadata extracted from the loaded file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MidiTrackInfo {
+    /// Zero-based track index.
+    pub index: usize,
+    /// Optional track name from MIDI meta events.
+    pub name: Option<String>,
+    /// Distinct MIDI channels used by this track (1-based, range `1..=16`).
+    pub channels: Vec<u8>,
+    /// Distinct MIDI program numbers used by this track.
+    pub programs: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 struct MidiSheet {
     sample_rate: u32,
@@ -463,6 +664,7 @@ struct MidiSheet {
     // One pulse per MIDI tick (nodi::Moment).
     pulses: Vec<Pulse>,
     total_ticks: usize,
+    track_infos: Vec<MidiTrackInfo>,
     modified: SystemTime,
 }
 
@@ -476,35 +678,88 @@ impl MidiSheet {
             Timing::Metrical(n) => u16::from(n),
             _ => return Err(TimeFormatError.into()),
         };
+        let mut tick_events: HashMap<u64, Vec<RawMidiEvent>> = HashMap::new();
+        let mut tempo_changes: HashMap<u64, u32> = HashMap::new();
+        let mut max_tick = 0_u64;
+        let mut track_infos = Vec::with_capacity(tracks.len());
 
-        let sheet = match header.format {
-            Format::SingleTrack | Format::Sequential => Sheet::sequential(&tracks),
-            Format::Parallel => Sheet::parallel(&tracks),
+        for (track_index, track) in tracks.iter().enumerate() {
+            let mut absolute_tick = 0_u64;
+            let mut name = None;
+            let mut channels = BTreeSet::new();
+            let mut programs = BTreeSet::new();
+
+            for event in track {
+                absolute_tick = absolute_tick.saturating_add(u64::from(event.delta.as_int()));
+                max_tick = max_tick.max(absolute_tick);
+
+                match event.kind {
+                    TrackEventKind::Midi { channel, message } => {
+                        channels.insert(channel.as_int() + 1);
+                        if let MidiMessage::ProgramChange { program } = message {
+                            programs.insert(program.as_int());
+                        }
+                        tick_events.entry(absolute_tick).or_default().push(
+                            RawMidiEvent::from_track_event(track_index, channel.as_int(), message),
+                        );
+                    }
+                    TrackEventKind::Meta(MetaMessage::Tempo(tempo)) => {
+                        tempo_changes.insert(absolute_tick, tempo.as_int());
+                    }
+                    TrackEventKind::Meta(MetaMessage::TrackName(track_name)) if name.is_none() => {
+                        let decoded = String::from_utf8_lossy(track_name).trim().to_string();
+                        if !decoded.is_empty() {
+                            name = Some(decoded);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            track_infos.push(MidiTrackInfo {
+                index: track_index,
+                name,
+                channels: channels.into_iter().collect(),
+                programs: programs.into_iter().collect(),
+            });
+        }
+
+        let total_ticks_u64 = if tracks.is_empty() {
+            0
+        } else {
+            max_tick.saturating_add(1)
         };
-        let total_ticks = sheet.len();
+        let total_ticks = usize::try_from(total_ticks_u64)
+            .map_err(|_| "MIDI timeline is too large for this platform")?;
 
-        let mut duration = Pulse::duration_in_samples(500_000, ppqn as u64, sample_rate as u64);
-        let tempo = sheet
+        let initial_tempo = tempo_changes
             .iter()
-            .flat_map(|m| &m.events)
-            .find(|v| matches!(v, NodiEvent::Tempo(_)))
-            .map(|v| match v {
-                NodiEvent::Tempo(tempo) => us_per_beat_to_bpm(*tempo),
-                _ => unreachable!(),
-            })
-            .unwrap_or(120.0f32);
+            .min_by_key(|(tick, _tempo)| **tick)
+            .map(|(_tick, tempo)| *tempo)
+            .unwrap_or(500_000);
+        let tempo = us_per_beat_to_bpm(initial_tempo);
+        let mut duration =
+            Pulse::duration_in_samples(u64::from(initial_tempo), ppqn as u64, sample_rate as u64);
+        let mut pulses = Vec::with_capacity(total_ticks);
 
-        let pulses: Vec<Pulse> = sheet
-            .iter()
-            .map(|moment| Pulse::from_moment(moment, &mut duration, ppqn, sample_rate))
-            .collect();
-        debug_assert_eq!(pulses.len(), total_ticks);
+        for tick in 0..total_ticks {
+            if let Some(tempo) = tempo_changes.get(&(tick as u64)) {
+                duration =
+                    Pulse::duration_in_samples(u64::from(*tempo), ppqn as u64, sample_rate as u64);
+            }
+
+            pulses.push(Pulse {
+                duration,
+                events: tick_events.remove(&(tick as u64)).unwrap_or_default(),
+            });
+        }
 
         Ok(Self {
             sample_rate,
             pulses,
             total_ticks,
             tempo,
+            track_infos,
             modified,
         })
     }
@@ -529,33 +784,6 @@ struct Pulse {
 }
 
 impl Pulse {
-    // if moment contains tempo change, new duration is calculated and set, otherwise
-    // `initial_duration` is set as duration
-    fn from_moment(moment: &Moment, duration: &mut u32, ppqn: u16, sample_rate: u32) -> Self {
-        moment.events.iter().fold(
-            Pulse {
-                // we define default tempo to 120 BPM (or 500_000 us per beat)
-                duration: *duration,
-                events: vec![],
-            },
-            |mut result, event| {
-                match event {
-                    NodiEvent::Midi(event) => result.events.push((*event).into()),
-                    NodiEvent::Tempo(tempo) => {
-                        *duration = Self::duration_in_samples(
-                            *tempo as u64,
-                            ppqn as u64,
-                            sample_rate as u64,
-                        );
-                        result.duration = *duration;
-                    }
-                    _ => (),
-                }
-                result
-            },
-        )
-    }
-
     fn duration_in_samples(tempo_us: u64, ppqn: u64, sample_rate: u64) -> u32 {
         let numerator = (tempo_us * sample_rate) as f64;
         let denominator = (ppqn * 1_000_000) as f64;
@@ -565,17 +793,18 @@ impl Pulse {
 
 #[derive(Debug, Clone, Copy)]
 struct RawMidiEvent {
+    track_index: usize,
     channel: i32, // it's i32 for compatibility with rustysynth
     command: i32,
     data1: i32,
     data2: i32,
 }
 
-impl From<MidiEvent> for RawMidiEvent {
-    fn from(event: MidiEvent) -> Self {
-        let channel = event.channel.as_int() as i32;
+impl RawMidiEvent {
+    fn from_track_event(track_index: usize, channel: u8, message: MidiMessage) -> Self {
+        let channel = i32::from(channel);
 
-        let (command, data1, data2) = match event.message {
+        let (command, data1, data2) = match message {
             MidiMessage::NoteOn { key, vel } => (0x90, key.as_int() as i32, vel.as_int() as i32),
             MidiMessage::NoteOff { key, vel } => (0x80, key.as_int() as i32, vel.as_int() as i32),
             MidiMessage::Aftertouch { key, vel } => {
@@ -599,10 +828,53 @@ impl From<MidiEvent> for RawMidiEvent {
         };
 
         Self {
+            track_index,
             channel,
             command,
             data1,
             data2,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrackFilter;
+
+    #[test]
+    fn mute_and_solo_rules_follow_daw_semantics() {
+        let mut filter = TrackFilter::new(3);
+
+        assert!(filter.allows(0));
+        assert!(filter.allows(1));
+        assert!(filter.allows(2));
+
+        assert!(filter.set_muted(1, true));
+        assert!(filter.allows(0));
+        assert!(!filter.allows(1));
+        assert!(filter.allows(2));
+
+        assert!(filter.set_solo(2, true));
+        assert!(!filter.allows(0));
+        assert!(!filter.allows(1));
+        assert!(filter.allows(2));
+
+        assert!(filter.set_muted(2, true));
+        assert!(!filter.allows(2));
+
+        assert!(filter.clear_solos());
+        assert!(filter.allows(0));
+        assert!(!filter.allows(1));
+        assert!(!filter.allows(2));
+    }
+
+    #[test]
+    fn out_of_bounds_track_changes_are_ignored() {
+        let mut filter = TrackFilter::new(2);
+
+        assert!(!filter.set_muted(4, true));
+        assert!(!filter.set_solo(4, true));
+        assert_eq!(filter.is_muted(4), None);
+        assert_eq!(filter.is_solo(4), None);
     }
 }
